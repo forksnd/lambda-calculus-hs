@@ -2,17 +2,16 @@
 {-# LANGUAGE TupleSections #-}
 {-# OPTIONS_GHC -Wno-name-shadowing #-}
 
--- | Iso-Inductive Types — structural ADTs via fold\/unfold.
+-- | Iso-Inductive Types, structural ADTs via fold\/unfold.
 --
--- Replaces the nominal ADT representation from module 09 with a structural
--- encoding using iso-recursive types (@mu a. T@). Data type specs are
--- compiled into mu-types over nested sums of products: e.g.
--- @data ListBool = Nil | Cons Bool ListBool@ becomes @mu L. Unit + (Bool * L)@.
--- Constructor names are retained in the surface syntax for ergonomics, but the
--- core IR is purely structural — constructors implicitly fold and case
--- expressions implicitly unfold, using explicit 'SFold' and 'SUnfold'.
--- Type-level substitution ('substTy') handles unrolling by replacing the bound
--- variable with the mu-type itself.
+-- An alternative to nominal inductive types: a structural encoding using
+-- iso-recursive types (@mu a. T@). Data type specs are compiled into mu-types
+-- over nested sums of products: e.g. @data ListBool = Nil | Cons Bool ListBool@
+-- becomes @mu L. Unit + (Bool * L)@. Constructor names are retained in the
+-- surface syntax for ergonomics, but the core IR is purely structural.
+-- Constructors implicitly fold and case expressions implicitly unfold, using
+-- explicit 'SFold' and 'SUnfold'. Type-level substitution ('substTy') handles
+-- unrolling by replacing the bound variable with the mu-type itself.
 module Main where
 
 --------------------------------------------------------------------------------
@@ -39,11 +38,17 @@ import TestHarness (RunResult (..), runTest, runTestErr, section)
 --------------------------------------------------------------------------------
 -- Utils
 
+-- | A list that grows on the right. We use this as our environment
+-- representation because it matches the structure of de Bruijn indices: the
+-- most recently bound variable is at the end (index 0), and older bindings are
+-- further left (higher indices).
 data SnocList a
   = Snoc (SnocList a) a
   | Nil
   deriving (Show, Eq, Ord, Functor, Foldable)
 
+-- | Look up a value by de Bruijn index, counting from the right (most recent
+-- binding).
 nth :: SnocList a -> Int -> Maybe a
 nth xs i
   | i < 0 = Nothing
@@ -54,14 +59,19 @@ nth xs i
             (Snoc xs' _, i') -> go (xs', i' - 1)
        in go (xs, i)
 
+-- | Align two structures and traverse the result. Used by 'recordTactic' to
+-- check term fields against type fields.
 alignWithM :: (Traversable f, Semialign f, Applicative m) => (These a b -> m c) -> f a -> f b -> m (f c)
 alignWithM f as = traverse f . align as
 
 --------------------------------------------------------------------------------
--- Types
+-- Syntax
+--
+-- Three-level representation: 'Term' (surface syntax with named variables) is
+-- elaborated into 'Syntax' (core IR with de Bruijn indices), which is evaluated
+-- into 'Value' (semantic domain with closures and neutrals).
 
--- | 'Term' represents the concrete syntax of our langage generated
--- from text by a parser.
+-- | Surface syntax with named variables.
 data Term
   = Var Name
   | Lam Name Term
@@ -70,40 +80,64 @@ data Term
   | Pair Term Term
   | Fst Term
   | Snd Term
-  | InL Term
-  | InR Term
-  | SumCase Term (Name, Term) (Name, Term)
-  | Absurd Term
+  | -- | Left injection into a sum type.
+    InL Term
+  | -- | Right injection into a sum type.
+    InR Term
+  | -- | Binary sum elimination.
+    SumCase Term (Name, Term) (Name, Term)
+  | -- | Void elimination.
+    Absurd Term
   | Unit
   | Tru
   | Fls
   | If Term Term Term
-  | Record [(Name, Term)]
-  | Get Name Term
-  | Cnstr Name [Term]
-  | CaseRec Term [(Name, [Name], Term)]
-  | Integer Integer
-  | Natural Integer
-  | Real Scientific
+  | -- | A record literal.
+    Record [(Name, Term)]
+  | -- | Field projection from a record.
+    Get Name Term
+  | -- | Apply a named data constructor. The constructor name is used to look up
+    -- the 'DataTypeSpec' and derive the mu-type.
+    Cnstr Name [Term]
+  | -- | Pattern match on an iso-inductive type. Each branch names a
+    -- constructor, binds its fields, and provides a body.
+    CaseRec Term [(Name, [Name], Term)]
+  | -- | An integer literal.
+    Integer Integer
+  | -- | A natural number literal.
+    Natural Integer
+  | -- | A real number literal.
+    Real Scientific
   | Anno Type Term
-  | Hole
+  | -- | A typed hole, a missing subterm.
+    Hole
   deriving stock (Show, Eq, Ord)
 
+-- | The type language.
 data Type
   = FuncTy Type Type
   | PairTy Type Type
   | UnitTy
-  | SumTy Type Type
-  | VoidTy
+  | -- | Binary sum: @A + B@.
+    SumTy Type Type
+  | -- | The empty type.
+    VoidTy
   | BoolTy
-  | RecordTy [(Name, Type)]
-  | MuTy Name Type
-  | TVar Name
+  | -- | A record type.
+    RecordTy [(Name, Type)]
+  | -- | An iso-recursive type: @mu a. T@ where @a@ may appear in @T@ as a
+    -- recursive reference. Unrolled by substituting the whole mu-type for @a@.
+    MuTy Name Type
+  | -- | A type variable, bound by 'MuTy'.
+    TVar Name
   | NaturalTy
   | IntegerTy
   | RealTy
   deriving stock (Show, Eq, Ord)
 
+-- | A single data constructor: a name and a list of field types. Unlike module
+-- 09, field types are plain 'Type' values (recursive references use 'TVar'
+-- rather than a separate 'Rec' tag).
 data DataConstructorSpec
   = Constr Name [Type]
   deriving stock (Show, Eq, Ord)
@@ -114,9 +148,14 @@ getCnstrName (Constr nm _) = nm
 getCnstrTypes :: DataConstructorSpec -> [Type]
 getCnstrTypes (Constr _ xs) = xs
 
+-- | A complete data type definition. 'dataTypeSpecToMuTy' compiles this into an
+-- iso-recursive mu-type over nested sums of products.
 data DataTypeSpec = DataTypeSpec Name [DataConstructorSpec]
   deriving stock (Show, Eq, Ord)
 
+-- | Compile a data type spec into a mu-type. Each constructor becomes a branch
+-- of a nested sum, and its fields become a nested product. For example,
+-- @ListBool@ with @Nil | Cons Bool ListBool@ becomes @mu L. Unit + (Bool * L)@.
 dataTypeSpecToMuTy :: DataTypeSpec -> Type
 dataTypeSpecToMuTy (DataTypeSpec tyName cnstrs) =
   MuTy tyName $ foldSums $ fmap (foldProducts . getCnstrTypes) cnstrs
@@ -129,8 +168,7 @@ dataTypeSpecToMuTy (DataTypeSpec tyName cnstrs) =
     foldSums [x] = x
     foldSums (x : xs) = SumTy x (foldSums xs)
 
--- | 'Syntax' is the internal abstract syntax of our language. We
--- elaborate 'Term' values into 'Syntax' during typechecking.
+-- | Core IR with de Bruijn indices.
 data Syntax
   = SVar Ix
   | SLam Name Syntax
@@ -151,33 +189,42 @@ data Syntax
   | SInteger Integer
   | SNatural Integer
   | SReal Scientific
-  | SFold Syntax
-  | SUnfold Syntax Type
-  | SHole Type
+  | -- | Fold: wrap a value into a mu-type. Implicit in the surface syntax
+    -- (constructors fold automatically).
+    SFold Syntax
+  | -- | Unfold: unwrap a mu-type to expose the inner sum of products. Implicit
+    -- in the surface syntax (case expressions unfold automatically).
+    SUnfold Syntax Type
+  | -- | A hole in the core IR, carrying the expected type.
+    SHole Type
   deriving stock (Show, Eq, Ord)
 
--- | 'Value' is the evaluated form of expressions in our language.
+-- | The semantic domain. 'VNeutral' represents stuck computations.
 data Value
   = VNeutral Type Neutral
   | VLam Name Closure
   | VPair Value Value
   | VUnit
-  | VInL Value
-  | VInR Value
+  | -- | Left injection value.
+    VInL Value
+  | -- | Right injection value.
+    VInR Value
   | VTru
   | VFls
-  | VRecord [(Name, Value)]
+  | -- | An evaluated record.
+    VRecord [(Name, Value)]
   | VInteger Integer
   | VNatural Integer
   | VReal Scientific
-  | VFold Value
+  | -- | A folded value inside a mu-type. Unfolding extracts the inner value.
+    VFold Value
   deriving stock (Show, Eq, Ord)
 
 -- | Debruijn Indices
 --
--- 'Ix' is used to reference lambda bound terms with respect to
--- α-conversion. The index 'n' represents the value bound by the 'n'
--- lambda counting outward from the site of the index.
+-- 'Ix' is used to reference lambda bound terms with respect to α-conversion.
+-- The index 'n' represents the value bound by the 'n' lambda counting outward
+-- from the site of the index.
 --
 -- λ.λ.λ.2
 -- ^-----^
@@ -187,15 +234,14 @@ newtype Ix
 
 -- | Debruijn Levels
 --
--- Similar to Debruijn Indices but counting inward from the outermost
--- lambda.
+-- Similar to Debruijn Indices but counting inward from the outermost lambda.
 --
 -- λ.λ.λ.0
 -- ^-----^
 --
--- Levels eliminate the need to reindex free variables when weakening
--- the context. This is useful in our 'Value' representation of
--- lambdas where we have a 'Closure' holding a stack of free variables.
+-- Levels eliminate the need to reindex free variables when weakening the
+-- context. This is useful in our 'Value' representation of lambdas where we
+-- have a 'Closure' holding a stack of free variables.
 newtype Lvl
   = Lvl Int
   deriving newtype (Show, Eq, Ord)
@@ -209,6 +255,8 @@ incLevel (Lvl n) = Lvl (1 + n)
 newtype Name = Name {getName :: String}
   deriving newtype (Show, Eq, Ord, IsString)
 
+-- | A neutral term: a head variable (or hole) applied to a spine of eliminators
+-- that can't reduce.
 data Neutral = Neutral {head :: Head, spine :: SnocList Frame}
   deriving stock (Show, Eq, Ord)
 
@@ -217,26 +265,39 @@ data Head
   | VHole Type
   deriving (Show, Eq, Ord)
 
+-- | A single eliminator in a neutral's spine.
 data Frame
   = VApp Type Value
   | VFst
   | VSnd
-  | VSumCase Type Type Type Value Value
-  | VSumAbsurd Type
-  | VIf Type Value Value
-  | VGet Name
-  | VUnfold Type
+  | -- | A stuck sum case.
+    VSumCase Type Type Type Value Value
+  | -- | A stuck absurd.
+    VSumAbsurd Type
+  | -- | A stuck if-then-else.
+    VIf Type Value Value
+  | -- | A stuck record projection.
+    VGet Name
+  | -- | A stuck unfold on a neutral mu-typed value.
+    VUnfold Type
   deriving stock (Show, Eq, Ord)
 
 pushFrame :: Neutral -> Frame -> Neutral
 pushFrame Neutral {..} frame = Neutral {head = head, spine = Snoc spine frame}
 
+-- | A closure pairs a function body with the environment it was defined in.
+-- Instantiation extends the captured environment with the argument value.
 data Closure = Closure {env :: SnocList Value, body :: Syntax}
   deriving stock (Show, Eq, Ord)
 
 --------------------------------------------------------------------------------
 -- Environment
+--
+-- The typechecker's context tracks names (for resolving named variables), types
+-- (for typechecking), values (for quoting), and the ADT constructor registry
+-- (for looking up data type specs during constructor and case elaboration).
 
+-- | A single binding in the context.
 data Cell = Cell
   { cellName :: Name,
     cellType :: Type,
@@ -255,9 +316,8 @@ data Env = Env
   }
   deriving stock (Show, Eq, Ord)
 
--- | We predefine a few ADTs here for demonstration purposes. In a
--- complete language these would be defined using 'data' declarations
--- in a module.
+-- | We predefine a few ADTs here for demonstration purposes. In a complete
+-- language these would be defined using 'data' declarations in a module.
 stockADTs :: Map Name DataTypeSpec
 stockADTs =
   Map.fromList
@@ -319,6 +379,8 @@ freshVar Env {size} ty = VNeutral ty $ Neutral (VVar $ Lvl size) Nil
 freshCell :: Env -> Name -> Type -> Cell
 freshCell ctx name ty = Cell name ty (freshVar ctx ty)
 
+-- | Substitute a type for a named type variable throughout a type expression.
+-- Used by 'unrollMuTy' to replace the bound variable with the mu-type itself.
 substTy :: Name -> Type -> Type -> Type
 substTy name replacement = go
   where
@@ -332,18 +394,18 @@ substTy name replacement = go
     go (RecordTy fields) = RecordTy (fmap (fmap go) fields)
     go t = t
 
--- | Unroll a μ-type by substituting the μ-type itself for the bound
--- variable in the body. For example:
+-- | Unroll a μ-type by substituting the μ-type itself for the bound variable in
+-- the body. For example:
 --
 -- unrollMuTy (μL. Unit + (Bool × L)) = Unit + (Bool × (μL. Unit + (Bool × L)))
 unrollMuTy :: Type -> Type
 unrollMuTy mu@(MuTy name body) = substTy name mu body
 unrollMuTy ty = ty
 
--- | Weaken a 'Syntax' term by incrementing all free de Bruijn indices
--- by one. This is needed when pushing a term under an additional binder,
--- such as the lambdas introduced by 'buildCase' when elaborating n-ary
--- case expressions into nested binary sum eliminations.
+-- | Weaken a 'Syntax' term by incrementing all free de Bruijn indices by one.
+-- This is needed when pushing a term under an additional binder, such as the
+-- lambdas introduced by 'buildCase' when elaborating n-ary case expressions
+-- into nested binary sum eliminations.
 weakenSyntax :: Syntax -> Syntax
 weakenSyntax = go 0
   where
@@ -372,6 +434,12 @@ weakenSyntax = go 0
 
 --------------------------------------------------------------------------------
 -- Typechecker
+--
+-- Bidirectional typechecking with elaboration and subtyping. The key additions:
+-- 'constructorTactic' synthesizes a constructor application by looking up the
+-- data type spec, computing the mu-type, and elaborating to 'SFold' with
+-- sum/product injections. 'caseRecTactic' checks a pattern match by unfolding
+-- the mu-type and building nested binary sum eliminations.
 
 data Error
   = TypeError String
@@ -424,6 +492,8 @@ check tm = subTactic (synth tm)
 
 -- | Var Tactic
 --
+-- Resolve a named variable to its type and elaborated form.
+--
 -- (x : A) ∈ Γ
 -- ─────────── Var⇒
 --  Γ ⊢ x ⇒ A
@@ -439,6 +509,9 @@ varTactic bndr = Synth $ do
 
 -- | Sub Tactic
 --
+-- The bridge between synth and check. Synthesize a type for the term, then
+-- verify it is a subtype of the expected type.
+--
 -- Γ ⊢ e ⇒ A  A <∶ B
 -- ──────────────── Sub⇐
 --    Γ ⊢ e ⇐ B
@@ -451,6 +524,8 @@ subTactic (Synth synth) = Check $ \ty1 -> do
 
 -- | Anno Tactic
 --
+-- The annotation provides a type, switching from synth to check.
+--
 --    Γ ⊢ e ⇐ A
 -- ─────────────── Anno⇒
 -- Γ ⊢ (e : A) ⇒ A
@@ -461,6 +536,8 @@ annoTactic ty (Check check) = Synth $ do
 
 -- | Unit Introduction Tactic
 --
+-- Verify the expected type is 'UnitTy' (or a supertype).
+--
 -- ───────────── Unit⇐
 -- Γ ⊢ () ⇐ Unit
 unitTactic :: Check
@@ -470,6 +547,8 @@ unitTactic = Check $ \case
   ty -> throwError $ TypeError $ "'Unit' cannot be a subtype of '" <> show ty <> "'"
 
 -- | Lambda Introduction Tactic
+--
+-- Checked against a function type. Binds a fresh neutral for the parameter.
 --
 --  Γ, x : A₁ ⊢ e ⇐ A₂
 -- ──────────────────── LamIntro⇐
@@ -483,10 +562,12 @@ lamTactic bndr (Check bodyTac) = Check $ \case
     pure $ SLam bndr fiber
   ty -> throwError $ TypeError $ "Tried to introduce a lambda at a non-function type: " <> show ty
 
--- | Lambda Elination Tactic
+-- | Lambda Elimination Tactic
+--
+-- Synthesize the function's type, check the argument against its domain.
 --
 -- Γ ⊢ e₁ ⇒ A → B  Γ ⊢ e₂ ⇐ A
--- ────────────────────────── LamElim⇐
+-- ────────────────────────── LamElim⇒
 --       Γ ⊢ e₁ e₂ ⇒ B
 applyTactic :: Synth -> Check -> Synth
 applyTactic (Synth funcTac) (Check argTac) =
@@ -503,16 +584,14 @@ applyTactic (Synth funcTac) (Check argTac) =
 --  ──────────────────────────────────── Let⇐
 --        Γ ⊢ let x = e in body ⇐ B
 --
--- @let x = e in body@ elaborates to @(λx. body') e'@ — there is no
--- dedicated @SLet@ in the core syntax. The let is fully dissolved by
--- NbE: the beta redex reduces and the bound value is inlined into
--- the normal form.
+-- @let x = e in body@ elaborates to @(λx. body') e'@. There is no dedicated
+-- @SLet@ in the core syntax. The let is fully dissolved by NbE: the beta redex
+-- reduces and the bound value is inlined into the normal form.
 --
--- Unlike 'lamTactic', which binds a fresh neutral variable (since the
--- argument is unknown), the let tactic evaluates @e@ and stores the
--- resulting value in the context cell. This means references to @x@
--- in the body see the actual value during elaboration, not a stuck
--- variable.
+-- Unlike 'lamTactic', which binds a fresh neutral variable (since the argument
+-- is unknown), the let tactic evaluates @e@ and stores the resulting value in
+-- the context cell. This means references to @x@ in the body see the actual
+-- value during elaboration, not a stuck variable.
 letTactic :: Name -> Synth -> Check -> Check
 letTactic bndr (Synth synth) (Check bodyTac) = Check $ \ty -> do
   (ty1, tm1) <- synth
@@ -523,6 +602,8 @@ letTactic bndr (Synth synth) (Check bodyTac) = Check $ \ty -> do
   pure $ SAp (SLam bndr fiber) tm1
 
 -- | Pair Introduction Tactic
+--
+-- Checked against a pair type.
 --
 -- Γ ⊢ a ⇐ A   Γ ⊢ b ⇐ B
 -- ───────────────────── Pair⇐
@@ -537,6 +618,8 @@ pairTactic (Check checkFst) (Check checkSnd) = Check $ \case
 
 -- | Pair Fst Elimination Tactic
 --
+-- Synthesize the pair's type, return the first component.
+--
 -- Γ ⊢ (t₁ , t₂) ⇒ A × B
 -- ───────────────────── Fst⇒
 --       Γ ⊢ t₁ ⇒ A
@@ -549,9 +632,11 @@ fstTactic (Synth synth) =
 
 -- | Pair Snd Elimination Tactic
 --
+-- Synthesize the pair's type, return the second component.
+--
 -- Γ ⊢ (t₁ , t₂) ⇒ A × B
 -- ───────────────────── Snd⇒
---       Γ ⊢ t₂ ⇒ A
+--       Γ ⊢ t₂ ⇒ B
 sndTactic :: Synth -> Synth
 sndTactic (Synth synth) =
   Synth $
@@ -607,6 +692,9 @@ constructorTactic nm checks = Synth $
 
 -- | InL Introduction Tactic
 --
+-- Checked against a sum type. The payload is checked against the
+-- left component.
+--
 --      Γ ⊢ e ⇐ A
 --  ───────────────── InL⇐
 --  Γ ⊢ InL e ⇐ A + B
@@ -617,6 +705,9 @@ inLTactic (Check check) = Check $ \case
 
 -- | InR Introduction Tactic
 --
+-- Checked against a sum type. The payload is checked against the right
+-- component.
+--
 --  Γ ⊢ e ⇐ B
 --  ──────────────── InR⇐
 --  Γ ⊢ InR e ⇐ A + B
@@ -626,6 +717,10 @@ inRTactic (Check check) = Check $ \case
   ty -> throwError $ TypeError $ "Expected a Sum type but got: " <> show ty
 
 -- | Sum Case Elimination Tactic
+--
+-- Synthesize the scrutinee's sum type, then check each branch as a function
+-- from the injection's payload type to the motive.
+--
 --  Γ ⊢ e ⇒ A + B    Γ ⊢ f ⇐ A → C    Γ ⊢ g ⇐ B → C
 --  ─────────────────────────────────────────────── SumCase⇐
 --                Γ ⊢ SumCase e f g ⇐ C
@@ -640,6 +735,10 @@ sumCaseTactic (Synth synth) (Check checkT1) (Check checkT2) = Check $ \ty -> do
     _ -> throwError $ TypeError $ "Expected a Sum type but got: " <> show scrutTy
 
 -- | Void Elimination Tactic
+--
+-- Synthesize the scrutinee and verify it has type 'VoidTy'. Since no value of
+-- type 'Void' exists, this branch is unreachable, but it can produce any type
+-- @C@.
 --
 --  Γ ⊢ e ⇒ Void
 --  ─────────────── Absurd⇐
@@ -718,6 +817,7 @@ caseRecTactic (Synth scrutinee) cases = Check $ \ty -> do
 
 -- | Type Hole Tactic
 --
+-- A hole accepts any expected type and records it via the 'Writer' effect.
 --
 -- ────────── Hole⇐
 --  Γ ⊢ ? ⇐ A
@@ -728,8 +828,10 @@ holeTactic = Check $ \ty -> do
 
 -- | Bool-False Introduction Tactic
 --
+-- Checked against 'BoolTy' (or a supertype via subtyping).
+--
 -- ──────────────── False⇐
--- Γ ⊢ False ⇐ Unit
+-- Γ ⊢ False ⇐ Bool
 falseTactic :: Check
 falseTactic = Check $ \case
   BoolTy -> pure SFls
@@ -738,8 +840,10 @@ falseTactic = Check $ \case
 
 -- | Bool-True Introduction Tactic
 --
+-- Checked against 'BoolTy' (or a supertype via subtyping).
+--
 -- ──────────────── True⇐
--- Γ ⊢ True ⇐ Unit
+-- Γ ⊢ True ⇐ Bool
 trueTactic :: Check
 trueTactic = Check $ \case
   BoolTy -> pure STru
@@ -748,9 +852,12 @@ trueTactic = Check $ \case
 
 -- | Bool Elimination Tactic
 --
+-- Check the condition against 'BoolTy', and both branches against the expected
+-- (motive) type.
+--
 -- Γ ⊢ t₁ ⇐ Bool  Γ ⊢ t₂ ⇐ T  Γ ⊢ t₃ ⇐ T
 -- ───────────────────────────────────── If⇐
---   Γ ⊢ If t₁ then t₂ else t₃ ⇐ Bool
+--   Γ ⊢ If t₁ then t₂ else t₃ ⇐ T
 ifTactic :: Check -> Check -> Check -> Check
 ifTactic (Check checkT1) (Check checkT2) (Check checkT3) = Check $ \ty -> do
   tm1 <- checkT1 BoolTy
@@ -759,6 +866,9 @@ ifTactic (Check checkT1) (Check checkT2) (Check checkT3) = Check $ \ty -> do
   pure (SIf tm1 tm2 tm3)
 
 -- | Record Introduction Tactic
+--
+-- Checked against a record type. Uses 'alignWithM' to match the term's fields
+-- against the type's fields.
 --
 --         for each i  Γ ⊢ tᵢ ⇐ Tᵢ
 -- ─────────────────────────────────────── Record⇐
@@ -780,6 +890,8 @@ recordTactic fields = Check $ \case
 
 -- | Record Elimination Tactic
 --
+-- Synthesize the record's type, then look up the projected field.
+--
 -- Γ ⊢ t₁ ⇒ { lᵢ : Tᵢ (i ∈ I..n) }
 -- ─────────────────────────────── Get⇒
 --       Γ ⊢ Get lⱼ t₁ ⇒ Tⱼ
@@ -795,6 +907,8 @@ getTactic name (Synth fieldTac) =
 
 -- | Integer Introduction Tactic
 --
+-- Checked against 'IntegerTy' (or a supertype via subtyping).
+--
 -- ──────── ℤ⇐
 -- Γ ⊢ z ⇐  ℤ
 integerTactic :: Integer -> Check
@@ -804,6 +918,9 @@ integerTactic z = Check $ \case
   ty -> throwError $ TypeError $ "'Integer' cannot be a subtype of '" <> show ty <> "'"
 
 -- | Natural Introduction Tactic
+--
+-- Checked against 'NaturalTy' (or a supertype via subtyping). Validates that
+-- the literal is non-negative.
 --
 -- ───────── ℕ⇐
 -- Γ ⊢ n ⇐ ℕ
@@ -818,6 +935,8 @@ naturalTactic n = Check $ \case
 
 -- | Real Introduction Tactic
 --
+-- Checked against 'RealTy' (or a supertype via subtyping).
+--
 -- ───────── ℝ⇐
 -- Γ ⊢ r ⇐ ℝ
 realTactic :: Scientific -> Check
@@ -829,9 +948,9 @@ realTactic r = Check $ \case
 --------------------------------------------------------------------------------
 -- Subsumption
 
--- | The subtyping relationship T₁ <: T₂ can be read as "T₁ is a
--- subtype of T₂". It can be understood as stating that anywhere a T₂
--- can be used, we can use a T₁.
+-- | The subtyping relationship T₁ <: T₂ can be read as "T₁ is a subtype of T₂".
+-- It can be understood as stating that anywhere a T₂ can be used, we can use a
+-- T₁.
 isSubtypeOf :: Type -> Type -> Bool
 isSubtypeOf s@RecordTy {} t@RecordTy {} = recordSubtypeTactic s t
 isSubtypeOf s@FuncTy {} t@FuncTy {} = functionSubtypeTactic s t
@@ -842,10 +961,10 @@ isSubtypeOf super sub = super == sub
 
 -- | Record Depth Subtyping
 --
--- Any field of a record can be replaced by its subtype. Since any
--- operation supported for a field in the supertype is supported for
--- its subtype, any operation feasible on the record supertype is
--- supported by the record subtype.
+-- Any field of a record can be replaced by its subtype. Since any operation
+-- supported for a field in the supertype is supported for its subtype, any
+-- operation feasible on the record supertype is supported by the record
+-- subtype.
 --
 -- For example:
 --
@@ -857,9 +976,9 @@ isSubtypeOf super sub = super == sub
 -- ──────────────────────────────────────────────── RecordDepth
 -- { lᵢ : Sᵢ (i ∈ I..n) } <: { lᵢ : Tᵢ (i ∈ I..n) }
 --
--- Record width subtyping falls out of 'Map.isSubmapOfBy': the expected
--- record's keys must be a subset of the actual record's keys, so extra
--- fields in the actual record are ignored.
+-- Record width subtyping falls out of 'Map.isSubmapOfBy': the expected record's
+-- keys must be a subset of the actual record's keys, so extra fields in the
+-- actual record are ignored.
 --
 -- { foo :: Nat, bar :: Bool } <: { foo :: Nat }
 recordSubtypeTactic :: Type -> Type -> Bool
@@ -877,18 +996,17 @@ recordSubtypeTactic _ _ = error "impossible case in rec"
 --
 -- (ℤ → ℕ) <: (ℕ → ℤ)
 --
--- These feels backwards at first glance, but the received parameter
--- T₁/S₁ is contravariant. This reverses the subtyping relationship.
+-- These feels backwards at first glance, but the received parameter T₁/S₁ is
+-- contravariant. This reverses the subtyping relationship.
 --
--- Another way of stating the example above is that you can replace a
--- function ℕ → ℤ with a function ℤ → ℕ.
+-- Another way of stating the example above is that you can replace a function ℕ
+-- → ℤ with a function ℤ → ℕ.
 --
--- This works because any ℕ you would have applied to the supertype
--- function is also an ℤ which can also be applied to the subtype
--- function.
+-- This works because any ℕ you would have applied to the supertype function is
+-- also an ℤ which can also be applied to the subtype function.
 --
--- Likewise the ℕ produced by the subtype function is also a ℤ and
--- thus satisfies the super type's return param.
+-- Likewise the ℕ produced by the subtype function is also a ℤ and thus
+-- satisfies the super type's return param.
 --
 -- Thus our typing rule for function subtyping is:
 --
@@ -902,6 +1020,10 @@ functionSubtypeTactic _ _ = error "impossible case in functionSubTypeTactic"
 
 --------------------------------------------------------------------------------
 -- Evaluator
+--
+-- Evaluation maps 'Syntax' to 'Value' under an environment. 'SFold' evaluates
+-- to 'VFold'. 'SUnfold' on a 'VFold' extracts the inner value; on a neutral it
+-- produces a stuck 'VUnfold' frame.
 
 newtype EvalM a = EvalM {runEvalM :: SnocList Value -> a}
   deriving
@@ -1003,6 +1125,10 @@ instantiateClosure (Closure env body) v = local (const $ Snoc env v) $ eval body
 
 --------------------------------------------------------------------------------
 -- Quoting
+--
+-- Quoting reads back a 'Value' into 'Syntax' (normal form). Type-directed: at
+-- function types it eta-expands. 'VFold' at 'MuTy' quotes by unrolling the
+-- mu-type and quoting the inner value.
 
 quote :: Lvl -> Type -> Value -> EvalM Syntax
 quote l (FuncTy ty1 ty2) (VLam bndr clo@(Closure _env _body)) = do
